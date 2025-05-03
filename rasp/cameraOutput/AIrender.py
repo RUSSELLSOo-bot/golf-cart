@@ -141,13 +141,14 @@ def main():
 
         kps_smooth = filter_keypoints(kps, filters)
 
-        nosey, nosex, noseConfidence = kps_smooth[7]
+        nosey, nosex, noseConfidence = kps_smooth[0]
         h, w = frame.shape[:2]
 
         print(f"nose → y={nosey*h:.1f}, x={nosex*w:.1f}, score={noseConfidence:.1f}")
 
         draw_keypoints(frame, kps_smooth)
-
+        #draw_keypoints(frame, kps)
+        
         cv2.imshow("MoveNet Lightning (UINT8 TFLite)", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
