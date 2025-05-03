@@ -74,9 +74,60 @@ def draw_keypoints(frame, kps, thresh=0.3):
         color = {"m":(255,0,255),"c":(255,255,0),"y":(0,255,255)}[col]
         cv2.line(frame, pt1, pt2, color, 2)
 
+
+def init_kalman_filters(num_keypoints, dt=1/30, process_noise=1e-2, meas_noise=1e-1):
+    """
+    Create one 4D→2D constant‐velocity Kalman filter per keypoint.
+    State: [x, y, vx, vy];  Measurement: [x, y]
+    Returns a list of cv2.KalmanFilter objects of length num_keypoints.
+    """
+    filters = []
+    for _ in range(num_keypoints):
+        kf = cv2.KalmanFilter(4, 2, 0, cv2.CV_32F)
+        kf.transitionMatrix = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1,  0],
+            [0, 0, 0,  1],
+        ], np.float32)
+        kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], np.float32)
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * process_noise
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * meas_noise
+        kf.errorCovPost = np.eye(4, dtype=np.float32)
+        filters.append(kf)
+    return filters
+
+
+def filter_keypoints(kps, filters):
+    """
+    Apply your list of Kalman filters to the raw kps array.
+    - kps: (17,3) array of (y_norm, x_norm, score)
+    - filters: list of length 17 from init_kalman_filters()
+    Returns a new (17,3) array of smoothed (y_norm, x_norm, score).
+    """
+    smoothed = []
+    for idx, (y, x, score) in enumerate(kps):
+        # Predict + correct
+        filters[idx].predict()
+        meas = np.array([[np.float32(x)], [np.float32(y)]])
+        post = filters[idx].correct(meas)
+        sx, sy = float(post[0]), float(post[1])
+        smoothed.append((sy, sx, score))
+    return np.array(smoothed, dtype=np.float32)
+
+
+
+
 # ─── 3) Main loop ───────────────────────────
 def main():
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    filters = init_kalman_filters(17)
+
+
+
     if not cap.isOpened():
         print("ERROR: cannot open camera")
         return
@@ -87,7 +138,15 @@ def main():
             break
 
         kps = detect_pose(frame)
-        draw_keypoints(frame, kps)
+
+        kps_smooth = filter_keypoints(kps, filters)
+
+        nosey, nosex, noseConfidence = kps_smooth[7]
+        h, w = frame.shape[:2]
+
+        print(f"nose → y={nosey*h:.1f}, x={nosex*w:.1f}, score={noseConfidence:.1f}")
+
+        draw_keypoints(frame, kps_smooth)
 
         cv2.imshow("MoveNet Lightning (UINT8 TFLite)", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
