@@ -124,7 +124,10 @@ def filter_keypoints(kps, filters):
 # ─── 3) Main loop ───────────────────────────
 def main():
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap2 = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+
     filters = init_kalman_filters(17)
+    filters2 = init_kalman_filters(17)
 
 
 
@@ -134,22 +137,31 @@ def main():
 
     while True:
         ret, frame = cap.read()
+        ret2, frame2 = cap2.read()
+
         if not ret:
             break
 
         kps = detect_pose(frame)
-
         kps_smooth = filter_keypoints(kps, filters)
-
         nosey, nosex, noseConfidence = kps_smooth[0]
         h, w = frame.shape[:2]
+
+        kps2 = detect_pose(frame2)
+        kps_smooth2 = filter_keypoints(kps2, filters2)
+        nosey2, nosex2, noseConfidence2 = kps_smooth2[0]
+        h2, w2 = frame2.shape[:2]
+
 
         print(f"nose → y={nosey*h:.1f}, x={nosex*w:.1f}, score={noseConfidence:.1f}")
 
         draw_keypoints(frame, kps_smooth)
-        #draw_keypoints(frame, kps)
+        draw_keypoints(frame2, kps_smooth2)
+        #\draw_keypoints(frame, kps)
         
-        cv2.imshow("MoveNet Lightning (UINT8 TFLite)", frame)
+        cv2.imshow("MoveNet Lightning (UINT8 TFLite)Computer", frame)
+        cv2.imshow("MoveNet Lightning (UINT8 TFLite)Webcam", frame2)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
