@@ -2,6 +2,7 @@
 import os
 import cv2
 import numpy as np
+import time
 
 # Try standalone tflite-runtime first, else TF fallback
 try:
@@ -57,8 +58,15 @@ def detect_pose(frame):
     out = interpreter.get_tensor(output_det["index"])  # (1,1,17,3)
     return out[0,0]                                     # → (17,3)
 
-def draw_keypoints(frame, kps, thresh=0.3):
+def draw_keypoints(frame, kps, dt, thresh=0.3):
     h, w, _ = frame.shape
+
+    fps = 1 / dt if dt > 0 else 0
+
+    # Draw FPS on the top-left corner
+    fps_text = f"FPS: {fps:.2f}"
+    cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    
     # joints
     for y, x, score in kps:
         if score < thresh: continue
@@ -75,7 +83,7 @@ def draw_keypoints(frame, kps, thresh=0.3):
         cv2.line(frame, pt1, pt2, color, 2)
 
 
-def init_kalman_filters(num_keypoints, dt=1/30, process_noise=1e-2, meas_noise=1e-1):
+def init_kalman_filters(num_keypoints, dt=1/30, process_noise=1e-2, meas_noise=1e-2):
     """
     Create one 4D→2D constant‐velocity Kalman filter per keypoint.
     State: [x, y, vx, vy];  Measurement: [x, y]
@@ -83,20 +91,28 @@ def init_kalman_filters(num_keypoints, dt=1/30, process_noise=1e-2, meas_noise=1
     """
     filters = []
     for _ in range(num_keypoints):
-        kf = cv2.KalmanFilter(4, 2, 0, cv2.CV_32F)
+        # State: [x, y, vx, vy, ax, ay]; Measurement: [x, y]
+        kf = cv2.KalmanFilter(6, 2, 0, cv2.CV_32F)
+
+        # State transition matrix (accounts for acceleration)
         kf.transitionMatrix = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1,  0],
-            [0, 0, 0,  1],
+            [1, 0, dt, 0, 0.5 * dt**2, 0],
+            [0, 1, 0, dt, 0, 0.5 * dt**2],
+            [0, 0, 1, 0, dt, 0],
+            [0, 0, 0, 1, 0, dt],
+            [0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 1],
         ], np.float32)
+
+        # Measurement matrix (maps state to measurements)
         kf.measurementMatrix = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
         ], np.float32)
-        kf.processNoiseCov = np.eye(4, dtype=np.float32) * process_noise
+
+        kf.processNoiseCov = np.eye(6, dtype=np.float32) * process_noise
         kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * meas_noise
-        kf.errorCovPost = np.eye(4, dtype=np.float32)
+        kf.errorCovPost = np.eye(6, dtype=np.float32)
         filters.append(kf)
     return filters
 
@@ -119,53 +135,76 @@ def filter_keypoints(kps, filters):
     return np.array(smoothed, dtype=np.float32)
 
 
+def get_available_cameras(max_cameras=1):
+    """
+    Detect available camera indices.
+    """
+    available_cameras = []
+    for i in range(max_cameras):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            available_cameras.append(i)
+            cap.release()
 
+    #returns list of int indeces of cameras found        
+    return available_cameras
 
-# ─── 3) Main loop ───────────────────────────
 def main():
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    cap2 = cv2.VideoCapture(1, cv2.CAP_DSHOW)
-
-    filters = init_kalman_filters(17)
-    filters2 = init_kalman_filters(17)
-
-
-
-    if not cap.isOpened():
-        print("ERROR: cannot open camera")
+    available_cameras = get_available_cameras()
+    if not available_cameras:
+        print("ERROR: No cameras detected.")
         return
 
+    
+    num_cameras = int(len(available_cameras))
+    if num_cameras < 1 or num_cameras > len(available_cameras):
+        print("Invalid number of cameras.")
+        return
+
+    # caps is list of videoCapture objects for all indices in available_cameras
+    # filters_list is list of filter objects (but all are the same)
+    caps = [cv2.VideoCapture(idx, cv2.CAP_DSHOW) for idx in available_cameras[:num_cameras]]
+    filters_list = [init_kalman_filters(17) for _ in range(num_cameras)]
+
+    prev_time = time.time()
+
     while True:
-        ret, frame = cap.read()
-        ret2, frame2 = cap2.read()
-
-        if not ret:
-            break
-
-        kps = detect_pose(frame)
-        kps_smooth = filter_keypoints(kps, filters)
-        nosey, nosex, noseConfidence = kps_smooth[0]
-        h, w = frame.shape[:2]
-
-        kps2 = detect_pose(frame2)
-        kps_smooth2 = filter_keypoints(kps2, filters2)
-        nosey2, nosex2, noseConfidence2 = kps_smooth2[0]
-        h2, w2 = frame2.shape[:2]
-
-
-        print(f"nose → y={nosey*h:.1f}, x={nosex*w:.1f}, score={noseConfidence:.1f}")
-
-        draw_keypoints(frame, kps_smooth)
-        draw_keypoints(frame2, kps_smooth2)
-        #\draw_keypoints(frame, kps)
+        frames = []
+        keypoints = []
         
-        cv2.imshow("MoveNet Lightning (UINT8 TFLite)Computer", frame)
-        cv2.imshow("MoveNet Lightning (UINT8 TFLite)Webcam", frame2)
+
+
+        for cap, filters in zip(caps, filters_list):
+            ret, frame = cap.read()
+            current_time = time.time()
+            dt = current_time - prev_time
+            prev_time = current_time
+            
+            for kf in filters:
+                kf.transitionMatrix = np.array([
+                    [1, 0, dt, 0, 0.5 * dt**2, 0],
+                    [0, 1, 0, dt, 0, 0.5 * dt**2],
+                    [0, 0, 1, 0, dt, 0],
+                    [0, 0, 0, 1, 0, dt],
+                    [0, 0, 0, 0, 1, 0],
+                    [0, 0, 0, 0, 0, 1],
+                ], np.float32)
+
+            kps = detect_pose(frame)
+            kps_smooth = filter_keypoints(kps, filters)
+            draw_keypoints(frame, kps_smooth, dt)
+            frames.append(frame)
+            keypoints.append(kps_smooth)
+
+        # Display all frames
+        for i, frame in enumerate(frames):
+            cv2.imshow(f"Camera {i}", frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    cap.release()
+    for cap in caps:
+        cap.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
