@@ -83,7 +83,7 @@ def draw_keypoints(frame, kps, dt, thresh=0.3):
         cv2.line(frame, pt1, pt2, color, 2)
 
 
-def init_kalman_filters(num_keypoints, dt=1/30, process_noise=1e-2, meas_noise=1e-2):
+def init_kalman_filters(num_keypoints, dt=1/30, process_noise=1e-1, meas_noise=5e-1):
     """
     Create one 4D→2D constant‐velocity Kalman filter per keypoint.
     State: [x, y, vx, vy];  Measurement: [x, y]
