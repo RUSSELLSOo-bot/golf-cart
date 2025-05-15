@@ -124,6 +124,14 @@ def main():
                 break
 
             kps = detect_pose(frame)
+            # Get nose coordinates (first keypoint)
+            if kps is not None and len(kps) > 0:
+                y, x, conf = kps[0]  # Nose keypoint
+                if conf > 0.3:  # Only print if confidence is high enough
+                    h, w, _ = frame.shape
+                    pixel_x, pixel_y = int(x * w), int(y * h)
+                    print(f"\rNose position - Pixel(x,y): ({pixel_x}, {pixel_y}), Normalized(x,y): ({x:.3f}, {y:.3f})", end="")
+
             draw_keypoints(frame, kps, dt)
             frames.append(frame)
             keypoints.append(kps)
@@ -135,6 +143,7 @@ def main():
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+    print("\nExiting...")
     for cap in caps:
         cap.release()
     cv2.destroyAllWindows()

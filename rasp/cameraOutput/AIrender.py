@@ -3,6 +3,7 @@ import os
 import cv2
 import numpy as np
 import time
+from typing import List
 
 # Try standalone tflite-runtime first, else TF fallback
 try:
@@ -158,7 +159,7 @@ def init_kalman_filters(num_keypoints,
             pos_var_x, pos_var_y,           # Position variances
             vel_var_x, vel_var_y,           # Velocity variances
             acc_var_x, acc_var_y,           # Acceleration variances
-            dt=1/30, process_noise=1e-4):
+            dt=1/30, process_noise=1e-5):
     """
     Create one 6D→2D constant-acceleration Kalman filter per keypoint.
     State: [x, y, vx, vy, ax, ay]; Measurement: [x, y, vx, vy, ax, ay]
@@ -207,6 +208,120 @@ def get_available_cameras(max_cameras=1):
             cap.release()
     return available_cameras
 
+class NoiseParameters:
+    def __init__(self):
+        self.process_noise = 1e-10
+        self.measurement_scale = 1.0
+        
+    def create_window(self):
+        cv2.namedWindow('Noise Parameters', cv2.WINDOW_NORMAL)  # Make window resizable
+        # Create trackbars for noise adjustment
+        cv2.createTrackbar('Process Noise (e^x)', 'Noise Parameters', 50, 100, self._on_process_noise_change)
+        cv2.createTrackbar('Measurement Scale', 'Noise Parameters', 10, 100, self._on_measurement_scale_change)
+    
+    def _on_process_noise_change(self, value):
+        # Convert slider value to exponential scale from 1e-5 to 1e5
+        self.process_noise = 10 ** ((value - 50) / 10)
+        
+    def _on_measurement_scale_change(self, value):
+        # Convert slider value to 0.1 - 10.0 range
+        self.measurement_scale = value / 10.0
+
+    def update_filters(self, filters: List[cv2.KalmanFilter], original_meas_cov: np.ndarray):
+        """Update all filters with current noise parameters"""
+        for f in filters:
+            # Update process noise
+            process_noise_mat = np.eye(6, dtype=np.float32) * self.process_noise
+            f.processNoiseCov[...] = process_noise_mat
+            
+            # Update measurement noise
+            meas_noise_mat = original_meas_cov * self.measurement_scale
+            f.measurementNoiseCov[...] = meas_noise_mat
+
+class NoseFilter:
+    def __init__(self):
+        self.noise_params = NoiseParameters()
+        self.kf = None
+        self.original_meas_cov = None
+        self.prev_pos = None
+        self.prev_vel = None
+        self.prev_time = time.time()
+        self.is_calibrated = False
+        
+    def calibrate(self, duration=10):
+        """Calibrate the filter using camera feed"""
+        print("Starting calibration. Please stay still...")
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            raise RuntimeError("Could not open camera")
+            
+        try:
+            var_px, var_py, var_vx, var_vy, var_ax, var_ay, _, _ = calibrate_measurement_noise(
+                interpreter, input_det, output_det, cap, duration, keypoint_idx=0
+            )
+            
+            # Initialize Kalman filter with calibrated values
+            self.kf = init_kalman_filters(1, var_px, var_py, var_vx, var_vy, var_ax, var_ay)[0]
+            
+            # Store original measurement covariance
+            self.original_meas_cov = np.diag([
+                var_px, var_py, var_vx, var_vy, var_ax, var_ay
+            ]).astype(np.float32)
+            
+            # Create noise parameter window
+            self.noise_params.create_window()
+            self.is_calibrated = True
+            
+        finally:
+            cap.release()
+        
+        return self
+        
+    def update(self, x: float, y: float) -> tuple[float, float]:
+        """Update filter with new measurement and return filtered position"""
+        if not self.is_calibrated:
+            raise RuntimeError("Filter must be calibrated before use")
+            
+        current_time = time.time()
+        dt = current_time - self.prev_time
+        self.prev_time = current_time
+        
+        # Calculate derivatives
+        current_pos = np.array([x, y])
+        if self.prev_pos is not None:
+            current_vel = (current_pos - self.prev_pos) / dt
+            current_acc = (current_vel - self.prev_vel) / dt if self.prev_vel is not None else np.zeros(2)
+            self.prev_vel = current_vel
+        else:
+            current_vel = np.zeros(2)
+            current_acc = np.zeros(2)
+        
+        self.prev_pos = current_pos
+        
+        # Update noise parameters
+        self.noise_params.update_filters([self.kf], self.original_meas_cov)
+        
+        # Update Kalman filter
+        self.kf.predict()
+        measurement = np.array([
+            x, y,
+            current_vel[0], current_vel[1],
+            current_acc[0], current_acc[1]
+        ], dtype=np.float32).reshape(-1, 1)
+        
+        filtered_state = self.kf.correct(measurement)
+        
+        return float(filtered_state[0][0]), float(filtered_state[1][0])
+
+def create_calibrated_filter() -> NoseFilter:
+    """Create and calibrate a new nose filter"""
+    filter = NoseFilter()
+    return filter.calibrate()
+
+def filter_point(x: float, y: float, filter: NoseFilter) -> tuple[float, float]:
+    """Filter a single point using provided calibrated filter"""
+    return filter.update(x, y)
+
 def main():
     available_cameras = get_available_cameras()
     if not available_cameras:
@@ -236,6 +351,17 @@ def main():
                                         acc_var_y=var_ay, 
                                        ) for _ in range(num_cameras)]
 
+    # Initialize noise parameters
+    noise_params = NoiseParameters()
+    noise_params.create_window()
+    
+    # Store original measurement noise covariance
+    original_meas_cov = np.diag([
+        var_px, var_py,
+        var_vx, var_vy,
+        var_ax, var_ay
+    ]).astype(np.float32)
+
     prev_time = time.time()
     prev_kps   = None   # last [y,x] positions
     prev_vels  = None   # last [vx,vy] velocities
@@ -243,6 +369,14 @@ def main():
     while True:
         frames = []
         keypoints = []
+
+        # Update filter parameters and verify changes
+        for filters in filters_list:
+            noise_params.update_filters(filters, original_meas_cov)
+            # Debug print - uncomment to verify values are changing
+            # print(f"\rProcess Noise: {filters[0].processNoiseCov[0,0]:.2e}, "
+            #       f"Measurement Scale: {filters[0].measurementNoiseCov[0,0]/original_meas_cov[0,0]:.2f}", 
+            #       end="")
 
         for cap, filters in zip(caps, filters_list):
             ret, frame = cap.read()
@@ -293,12 +427,29 @@ def main():
         for i, frame in enumerate(frames):
             cv2.imshow(f"Camera {i}", frame)
 
+            # Add these lines to show current parameter values
+            cv2.putText(frame, 
+                       f"Process Noise: {noise_params.process_noise:.1e}", 
+                       (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 
+                       0.5, 
+                       (0, 255, 0), 
+                       1)
+            cv2.putText(frame, 
+                       f"Measurement Scale: {noise_params.measurement_scale:.1f}", 
+                       (10, 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 
+                       0.5, 
+                       (0, 255, 0), 
+                       1)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
     for cap in caps:
         cap.release()
     cv2.destroyAllWindows()
+    cv2.destroyWindow('Noise Parameters')
 
 if __name__ == "__main__":
     main()
