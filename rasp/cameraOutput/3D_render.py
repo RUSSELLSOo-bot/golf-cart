@@ -5,7 +5,7 @@ import pygame
 from pygame.locals import *  # This imports OPENGL, DOUBLEBUF, etc.
 from OpenGL.GL import *
 from OpenGL.GLU import *
-
+import time
 class Camera3D:
     def __init__(self):
         # Camera intrinsic parameters
@@ -41,7 +41,7 @@ class IsometricView:
         # Isometric view setup
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
-        gluLookAt(0.1, .1, 3,    # Camera position
+        gluLookAt(1, 1, 3,    # Camera position
                   0, 0, 0,    # Look at center
                   0, 1, 0)    # Up vector
 
@@ -77,8 +77,12 @@ def main():
     camera = Camera3D()
     view = IsometricView()
     cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    cap.set(cv2.CAP_PROP_FOCUS, 250)
+
     nose_filter = AIrender.create_calibrated_filter()
     running = True
+    prev_time = time.time()
     while running:
         # Handle events
         for event in pygame.event.get():
@@ -91,7 +95,11 @@ def main():
             kps = AIrender.detect_pose(frame)
             if kps is not None and len(kps) > 0:
                 y, x, conf = kps[0]  # Nose keypoint
-                filtered_x, filtered_y = AIrender.filter_point(x, y, nose_filter)
+                current_time = time.time()
+                dt = current_time - prev_time
+                prev_time = current_time 
+
+                filtered_x, filtered_y = AIrender.filter_point(x, y,dt, nose_filter)
 
                 if conf > 0.3:
                     h, w = frame.shape[:2]
