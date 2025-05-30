@@ -260,11 +260,11 @@ def main():
     if num_cameras < 1:
         print("Invalid number of cameras.")
         return
-
+    print('ok')
     # Single calibration sequence for both parameter optimization and filter initialization
     print("\n=== Running Auto-calibration ===")
     auto_calibrator = AutoCalibrator(interpreter, input_det, output_det)
-    still_data, move_data = auto_calibrator.run_calibration(duration=10)
+    still_data, move_data = auto_calibrator.run_calibration(duration_per_phase=10)
     best_q, best_r = auto_calibrator.optimize_parameters(still_data, move_data)
     print(f"Optimal parameters found:")
     print(f"Process noise (Q): {best_q:.2e}")
@@ -447,6 +447,8 @@ class AutoCalibrator:
                         accelerations.append(current_acc)
                     
                     prev_vel = current_vel
+                else:
+                    prev_vel = np.zeros(2, dtype=np.float32)
                 prev_pos = current_pos
                 
                 # Show progress
@@ -460,10 +462,10 @@ class AutoCalibrator:
                 break
                 
         return CalibrationData(
-            np.array(positions),
-            np.array(velocities),
-            np.array(accelerations),
-            np.array(timestamps)
+            np.array(positions, dtype=np.float32),  # Ensure float32
+            np.array(velocities, dtype=np.float32),
+            np.array(accelerations, dtype=np.float32),
+            np.array(timestamps, dtype=np.float32)
         )
     
     @staticmethod
@@ -494,6 +496,19 @@ class AutoCalibrator:
     def optimize_parameters(self, still_data: CalibrationData, 
                           move_data: CalibrationData) -> Tuple[float, float]:
         """Find optimal Q,R parameters using grid search"""
+        # Calculate base measurement covariance from still data
+        var_px = np.var(still_data.positions[:,0])
+        var_py = np.var(still_data.positions[:,1])
+        var_vx = np.var(still_data.velocities[:,0])
+        var_vy = np.var(still_data.velocities[:,1])
+        var_ax = np.var(still_data.accelerations[:,0])
+        var_ay = np.var(still_data.accelerations[:,1])
+        
+        # Initialize measurement covariance matrix
+        self.original_meas_cov = np.diag([
+            var_px, var_py, var_vx, var_vy, var_ax, var_ay
+        ]).astype(np.float32)
+
         # Parameter search space
         qs = np.logspace(-12, -2, 15)  # Process noise values
         rs = np.linspace(0.1, 10.0, 15) # Measurement noise scales
@@ -532,55 +547,82 @@ class AutoCalibrator:
     def _simulate_filter(self, positions: np.ndarray, timestamps: np.ndarray, 
                         q: float, r: float) -> np.ndarray:
         """Simulate Kalman filter with given parameters on position data"""
-        # Initialize Kalman filter with base measurement noise
+        # Validate input shapes
+        if positions.ndim != 2 or positions.shape[1] != 2:
+            raise ValueError(f"Expected positions shape (N,2), got {positions.shape}")
+        if timestamps.ndim != 1:
+            raise ValueError(f"Expected timestamps shape (N,), got {timestamps.shape}")
+        if len(timestamps) != len(positions):
+            raise ValueError("Timestamps and positions must have same length")
+        
+
+        q = np.float32(q)
+        r = np.float32(r)
+        
+        # Convert to float32
+        positions = positions.astype(np.float32)
+        timestamps = timestamps.astype(np.float32)
+    
+        # Initialize Kalman filter
         kf = cv2.KalmanFilter(6, 6, 0, cv2.CV_32F)
         
-        # Set transition matrix (will update dt each step)
-        kf.transitionMatrix = np.array([
-            [1,0, 0,0, 0, 0],  # Will update with dt
-            [0,1, 0,0, 0, 0],
-            [0,0, 1,0, 0, 0],
-            [0,0, 0,1, 0, 0],
-            [0,0, 0,0, 1, 0],
-            [0,0, 0,0, 0, 1]
-        ], np.float32)
-        
+        # Initialize matrices (all float32)
+        kf.transitionMatrix = np.eye(6, dtype=np.float32)
         kf.measurementMatrix = np.eye(6, dtype=np.float32)
+        kf.processNoiseCov = np.eye(6, dtype=np.float32)
+        kf.measurementNoiseCov = np.eye(6, dtype=np.float32)
         kf.errorCovPost = np.eye(6, dtype=np.float32)
+        kf.errorCovPre = np.eye(6, dtype=np.float32)
+        
+        # Initial state
+        initial_state = np.array([
+            positions[0,0],  # x
+            positions[0,1],  # y
+            0.0,            # vx
+            0.0,            # vy
+            0.0,            # ax
+            0.0             # ay
+        ], dtype=np.float32).reshape(6, 1)
+        kf.statePost = initial_state
         
         filtered = np.zeros_like(positions)
+        filtered[0] = positions[0]  # First point is unfiltered
         prev_pos = positions[0]
-        prev_vel = np.zeros(2)
-        
+        prev_vel = np.zeros(2, dtype=np.float32)
+
         for i in range(len(positions)):
-            # Calculate dt
             dt = timestamps[i] - timestamps[i-1] if i > 0 else 1/30
             
-            # Update transition matrix with current dt
-            kf.transitionMatrix[0,2] = dt
-            kf.transitionMatrix[0,4] = 0.5*dt*dt
-            kf.transitionMatrix[1,3] = dt
-            kf.transitionMatrix[1,5] = 0.5*dt*dt
-            kf.transitionMatrix[2,4] = dt
-            kf.transitionMatrix[3,5] = dt
+            # Update transition matrix
+            kf.transitionMatrix = np.array([
+                [1,0, dt,0, 0.5*dt*dt,0],
+                [0,1, 0,dt, 0,0.5*dt*dt],
+                [0,0, 1,0,  dt,0],
+                [0,0, 0,1,  0,dt],
+                [0,0, 0,0,  1,0],
+                [0,0, 0,0,  0,1]
+            ], dtype=np.float32)
             
             # Update noise matrices
             kf.processNoiseCov = make_const_accel_Q(q, dt)
             kf.measurementNoiseCov = self.original_meas_cov * r
             
             # Calculate derivatives
-            current_pos = positions[i]
-            current_vel = (current_pos - prev_pos) / dt if i > 0 else np.zeros(2)
-            current_acc = (current_vel - prev_vel) / dt if i > 0 else np.zeros(2)
+            current_pos = positions[i].astype(np.float32)
+            current_vel = ((current_pos - prev_pos) / dt).astype(np.float32) if i > 0 else np.zeros(2, dtype=np.float32)
+            current_acc = ((current_vel - prev_vel) / dt).astype(np.float32) if i > 0 else np.zeros(2, dtype=np.float32)
             
-            # Predict and correct
+            # Predict step
             kf.predict()
+            
+            # Measurement vector
             z = np.array([
                 current_pos[0], current_pos[1],
                 current_vel[0], current_vel[1],
                 current_acc[0], current_acc[1]
             ], dtype=np.float32).reshape(-1, 1)
             
+            # Correct step
             filtered_state = kf.correct(z)
             filtered[i] = [filtered_state[0][0], filtered_state[1][0]]
             
@@ -600,3 +642,6 @@ class AutoCalibrator:
         h, w = frame.shape[:2]
         cv2.putText(frame, f"{text}: {progress:.1f}%", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+
+if __name__ == "__main__":
+    main()
