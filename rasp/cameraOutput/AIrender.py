@@ -4,6 +4,9 @@ import cv2
 import numpy as np
 import time
 from typing import List
+from scipy.signal import correlate
+from dataclasses import dataclass
+from typing import Tuple, List, Optional
 
 # Try standalone tflite-runtime first, else TF fallback
 try:
@@ -78,95 +81,11 @@ def set_camera_focus(cap):
     cap.set(cv2.CAP_PROP_FOCUS, 250)    # Set fixed focus value
     return cap
 
-def calibrate_measurement_noise(interpreter, input_det, output_det, cap, duration=10, keypoint_idx=0):
-    """
-    Calibrate measurement noise for position, velocity, and acceleration.
-    Calculates velocity and acceleration from frame-to-frame measurements.
-    Returns variances for position, velocity, and acceleration.
-    """
-    cap = set_camera_focus(cap)
-    positions = []
-    velocities = []
-    accelerations = []
-    prev_pos = None
-    prev_vel = None
-    prev_time = time.time()
-    start_time = time.time()
-    
-    print(f"Calibration started: Please stand still for {duration} seconds...")
-
-    while time.time() - start_time < duration:
-        current_time = time.time()
-        dt = current_time - prev_time
-        prev_time = current_time
-
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        # Get current position
-        inp = preprocess(frame)
-        interpreter.set_tensor(input_det["index"], inp)
-        interpreter.invoke()
-        out = interpreter.get_tensor(output_det["index"])
-        kps = out[0, 0]
-        y, x, score = kps[keypoint_idx]
-        current_pos = np.array([x, y])
-        
-        # Calculate velocity and acceleration if we have previous positions
-        if prev_pos is not None:
-            current_vel = (current_pos - prev_pos) / dt
-            velocities.append(current_vel)
-            
-            if prev_vel is not None:
-                current_acc = (current_vel - prev_vel) / dt
-                accelerations.append(current_acc)
-            
-            prev_vel = current_vel
-        
-        positions.append(current_pos)
-        prev_pos = current_pos
-
-        # Visual feedback
-        cv2.circle(frame, (int(x * frame.shape[1]), int(y * frame.shape[0])), 6, (0, 0, 255), -1)
-        cv2.imshow("Calibration", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cv2.destroyAllWindows()
-    
-    # Convert to numpy arrays
-    positions = np.array(positions)
-    velocities = np.array(velocities) if velocities else np.zeros((0, 2))
-    accelerations = np.array(accelerations) if accelerations else np.zeros((0, 2))
-    
-    # Calculate variances
-    pos_var_x = np.var(positions[:, 0])
-    pos_var_y = np.var(positions[:, 1])
-    vel_var_x = np.var(velocities[:, 0]) if len(velocities) > 0 else 0
-    vel_var_y = np.var(velocities[:, 1]) if len(velocities) > 0 else 0
-    acc_var_x = np.var(accelerations[:, 0]) if len(accelerations) > 0 else 0
-    acc_var_y = np.var(accelerations[:, 1]) if len(accelerations) > 0 else 0
-    
-    # Calculate mean positions
-    avg_pos_x = np.mean(positions[:, 0])
-    avg_pos_y = np.mean(positions[:, 1])
-    
-    print(f"Calibration complete:")
-    print(f"Position variance: x={pos_var_x:.6f}, y={pos_var_y:.6f}")
-    print(f"Velocity variance: x={vel_var_x:.6f}, y={vel_var_y:.6f}")
-    print(f"Acceleration variance: x={acc_var_x:.6f}, y={acc_var_y:.6f}")
-    
-    return (pos_var_x, pos_var_y,           # Position variances
-            vel_var_x, vel_var_y,           # Velocity variances
-            acc_var_x, acc_var_y,           # Acceleration variances
-            avg_pos_x, avg_pos_y)           # Mean positions
-
 def init_kalman_filters(num_keypoints, 
             pos_var_x, pos_var_y,           # Position variances
             vel_var_x, vel_var_y,           # Velocity variances
             acc_var_x, acc_var_y,           # Acceleration variances
-            dt=1/30, process_noise=1e-5):
+            dt=1/30):
     """
     Create one 6D→2D constant-acceleration Kalman filter per keypoint.
     State: [x, y, vx, vy, ax, ay]; Measurement: [x, y, vx, vy, ax, ay]
@@ -184,7 +103,7 @@ def init_kalman_filters(num_keypoints,
             [0,0, 0,  0, 0,        1],
         ], np.float32)
         kf.measurementMatrix = np.eye(6, dtype=np.float32)
-        kf.processNoiseCov = np.eye(6, dtype=np.float32) * process_noise
+        kf.processNoiseCov = np.eye(6, dtype=np.float32)
 
 
         kf.measurementNoiseCov = np.diag([
@@ -234,21 +153,6 @@ class NoiseParameters:
     def __init__(self):
         self.process_noise = 1e-10
         self.measurement_scale = 1.0
-        
-    def create_window(self):
-        cv2.namedWindow('Noise Parameters', cv2.WINDOW_NORMAL)  # Make window resizable
-        # Create trackbars for noise adjustment
-        cv2.createTrackbar('Process Noise (e^x)', 'Noise Parameters', 50, 100, self._on_process_noise_change)
-        cv2.createTrackbar('Measurement Scale', 'Noise Parameters', 10, 100, self._on_measurement_scale_change)
-    
-    def _on_process_noise_change(self, value):
-        self.process_noise = 10 ** ((value - 50) / 10) #best values seems to be 7-9 on the slider
-        #so slider converts to a process noise of 10**(-4.1) to 10**(-4.3)
-        
-    def _on_measurement_scale_change(self, value):
-        # Convert slider value to 0.1 - 10.0 range BEST SEEMS TO BE 100 FOR TRUE VALUE OF SLIDER
-        self.measurement_scale = value / 10.0
-    
 
     def update_filters(self, filters: List[cv2.KalmanFilter], original_meas_cov: np.ndarray, dt: float):
         for kf in filters:
@@ -266,36 +170,39 @@ class NoseFilter:
         self.prev_vel = None
         self.prev_time = time.time()
         self.is_calibrated = False
-        
+        self.auto_calibrator = None
+    
     def calibrate(self, duration=10):
-        """Calibrate the filter using camera feed"""
-        print("Starting calibration. Please stay still...")
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            raise RuntimeError("Could not open camera")
+        """Auto-calibrate filter parameters"""
+        self.auto_calibrator = AutoCalibrator(interpreter, input_det, output_det)
         
-        cap = set_camera_focus(cap)
+        # Run two-phase calibration
+        still_data, move_data = self.auto_calibrator.run_calibration(duration)
         
-        try:
-            var_px, var_py, var_vx, var_vy, var_ax, var_ay, _, _ = calibrate_measurement_noise(
-                interpreter, input_det, output_det, cap, duration, keypoint_idx=0
-            )
-            
-            # Initialize Kalman filter with calibrated values
-            self.kf = init_kalman_filters(1, var_px, var_py, var_vx, var_vy, var_ax, var_ay)[0]
-            
-            # Store original measurement covariance
-            self.original_meas_cov = np.diag([
-                var_px, var_py, var_vx, var_vy, var_ax, var_ay
-            ]).astype(np.float32)
-            
-            # Create noise parameter window
-            self.noise_params.create_window()
-            self.is_calibrated = True
-            
-        finally:
-            cap.release()
+        # Calculate measurement noise covariance from still phase
+        var_px = np.var(still_data.positions[:,0])
+        var_py = np.var(still_data.positions[:,1])
+        var_vx = np.var(still_data.velocities[:,0])
+        var_vy = np.var(still_data.velocities[:,1])
+        var_ax = np.var(still_data.accelerations[:,0])
+        var_ay = np.var(still_data.accelerations[:,1])
         
+        # Initialize Kalman filter
+        self.kf = init_kalman_filters(1, var_px, var_py, var_vx, var_vy, var_ax, var_ay)[0]
+        
+        # Store original measurement covariance
+        self.original_meas_cov = np.diag([
+            var_px, var_py, var_vx, var_vy, var_ax, var_ay
+        ]).astype(np.float32)
+        
+        # Find optimal noise parameters
+        best_q, best_r = self.auto_calibrator.optimize_parameters(still_data, move_data)
+        
+        # Set optimal parameters
+        self.noise_params.process_noise = best_q
+        self.noise_params.measurement_scale = best_r
+        
+        self.is_calibrated = True
         return self
         
     def update(self, dt: float, x: float, y: float) -> tuple[float, float]:
@@ -350,64 +257,66 @@ def main():
         return
 
     num_cameras = int(len(available_cameras))
-    if num_cameras < 1 or num_cameras > len(available_cameras):
+    if num_cameras < 1:
         print("Invalid number of cameras.")
         return
 
-    # --- Calibration step for measurement noise ---
-    cap_for_calib = cv2.VideoCapture(available_cameras[0], cv2.CAP_DSHOW)
-    cap_for_calib = set_camera_focus(cap_for_calib)
-    print("Measurement noise covariance BEFORE calibration (nose):", 1.0)
-    var_px, var_py, var_vx, var_vy,var_ax, var_ay, avg_pos_x, avg_pose_y = calibrate_measurement_noise(interpreter, input_det, output_det, cap_for_calib, duration=10, keypoint_idx=0)
-    cap_for_calib.release()
-    print("Measurement noise covariance AFTER calibration (nose):", var_px, var_py, var_vx, var_vy,var_ax, var_ay, avg_pos_x, avg_pose_y )
+    # Single calibration sequence for both parameter optimization and filter initialization
+    print("\n=== Running Auto-calibration ===")
+    auto_calibrator = AutoCalibrator(interpreter, input_det, output_det)
+    still_data, move_data = auto_calibrator.run_calibration(duration=10)
+    best_q, best_r = auto_calibrator.optimize_parameters(still_data, move_data)
+    print(f"Optimal parameters found:")
+    print(f"Process noise (Q): {best_q:.2e}")
+    print(f"Measurement scale (R): {best_r:.2f}")
 
-    # Use calibrated values for the nose keypoint
+    # Use still_data for variance calculations (same as calibrate_measurement_noise)
+    var_px = np.var(still_data.positions[:,0])
+    var_py = np.var(still_data.positions[:,1])
+    var_vx = np.var(still_data.velocities[:,0])
+    var_vy = np.var(still_data.velocities[:,1])
+    var_ax = np.var(still_data.accelerations[:,0])
+    var_ay = np.var(still_data.accelerations[:,1])
+
+    # Remove calibrate_measurement_noise function since we now use auto_calibrator data
+
+    # Initialize measurement covariance
+    meas_cov = np.diag([var_px, var_py, var_vx, var_vy, var_ax, var_ay]).astype(np.float32)
+    scaled_meas_cov = meas_cov * best_r
+
+    # Setup cameras and filters
     caps = [cv2.VideoCapture(idx, cv2.CAP_DSHOW) for idx in available_cameras[:num_cameras]]
     caps = [set_camera_focus(cap) for cap in caps]
-    filters_list = [init_kalman_filters(17, 
-                                        pos_var_x=var_px, 
-                                        pos_var_y=var_py,
-                                        vel_var_x=var_vx,
-                                        vel_var_y=var_vy,
-                                        acc_var_x=var_ax,
-                                        acc_var_y=var_ay, 
-                                       ) for _ in range(num_cameras)]
+    filters_list = [init_kalman_filters(17, var_px, var_py, var_vx, var_vy, var_ax, var_ay) 
+                   for _ in range(num_cameras)]
 
-    # Initialize noise parameters
-    noise_params = NoiseParameters()
-    noise_params.create_window()
-    
-    # Store original measurement noise covariance
-    original_meas_cov = np.diag([
-        var_px, var_py,
-        var_vx, var_vy,
-        var_ax, var_ay
-    ]).astype(np.float32)
+    # Initialize filters with optimal parameters
+    for filters in filters_list:
+        for kf in filters:
+            kf.measurementNoiseCov = scaled_meas_cov
+            # Initial process noise (will be updated with dt)
+            kf.processNoiseCov = make_const_accel_Q(best_q, 1/30)
 
     prev_time = time.time()
-    prev_kps   = None   # last [y,x] positions
-    prev_vels  = None   # last [vx,vy] velocities
+    prev_kps = None
+    prev_vels = None
 
     while True:
         frames = []
         keypoints = []
-
-        # Update filter parameters and verify changes
         
-            # Debug print - uncomment to verify values are changing
-            # print(f"\rProcess Noise: {filters[0].processNoiseCov[0,0]:.2e}, "
-            #       f"Measurement Scale: {filters[0].measurementNoiseCov[0,0]/original_meas_cov[0,0]:.2f}", 
-            #       end="")
+        current_time = time.time()
+        dt = current_time - prev_time
+        prev_time = current_time
+
+        # Update process noise with current dt for all filters
+        process_noise = make_const_accel_Q(best_q, dt)
+        for filters in filters_list:
+            for kf in filters:
+                kf.processNoiseCov = process_noise
 
         for cap, filters in zip(caps, filters_list):
             ret, frame = cap.read()
-            current_time = time.time()
-            dt = current_time - prev_time
-            prev_time = current_time 
-
-            for filters in filters_list:
-                noise_params.update_filters(filters, original_meas_cov, dt)
 
             kps = detect_pose(frame)
 
@@ -453,22 +362,6 @@ def main():
         for i, frame in enumerate(frames):
             cv2.imshow(f"Camera {i}", frame)
 
-            # Add these lines to show current parameter values
-            cv2.putText(frame, 
-                       f"Process Noise: {noise_params.process_noise:.1e}", 
-                       (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.5, 
-                       (0, 255, 0), 
-                       1)
-            cv2.putText(frame, 
-                       f"Measurement Scale: {noise_params.measurement_scale:.1f}", 
-                       (10, 80), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.5, 
-                       (0, 255, 0), 
-                       1)
-
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -477,5 +370,233 @@ def main():
     cv2.destroyAllWindows()
     cv2.destroyWindow('Noise Parameters')
 
-if __name__ == "__main__":
-    main()
+@dataclass
+class CalibrationData:
+    positions: np.ndarray    # Shape: (N,2) for x,y positions
+    velocities: np.ndarray   # Shape: (N-1,2) for vx,vy
+    accelerations: np.ndarray # Shape: (N-2,2) for ax,ay
+    timestamps: np.ndarray   # Shape: (N,) for time points
+    
+class AutoCalibrator:
+    def __init__(self, interpreter, input_det, output_det):
+        self.interpreter = interpreter
+        self.input_det = input_det
+        self.output_det = output_det
+        # Calculate base measurement covariance in run_calibration
+        self.original_meas_cov = None
+    
+    def run_calibration(self, duration_per_phase=10) -> Tuple[CalibrationData, CalibrationData]:
+        """Run two-phase calibration process"""
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            raise RuntimeError("Could not open camera")
+        cap = set_camera_focus(cap)
+        
+        try:
+            # Phase 1: Still calibration
+            still_data = self._run_calibration_phase(cap, duration_per_phase, "STILL")
+            time.sleep(2)  # Brief pause between phases
+            # Phase 2: Movement calibration  
+            move_data = self._run_calibration_phase(cap, duration_per_phase, "MOVEMENT")
+            return still_data, move_data
+            
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+    
+    def _run_calibration_phase(self, cap, duration: int, phase: str) -> CalibrationData:
+        """Run single calibration phase with UI"""
+        # Show countdown
+        for i in range(5,0,-1):
+            ret, frame = cap.read()
+            if ret:
+                self._draw_countdown(frame, f"Get ready for {phase} phase", i)
+                cv2.imshow("Calibration", frame)
+                cv2.waitKey(1000)  # 1 second delay
+                
+        # Collect data
+        positions = []
+        velocities = []
+        accelerations = []
+        timestamps = []
+        
+        start_time = time.time()
+        prev_pos = None
+        prev_vel = None
+        
+        while time.time() - start_time < duration:
+            ret, frame = cap.read()
+            if not ret: continue
+            
+            current_time = time.time() - start_time
+            kps = detect_pose(frame)
+            y, x, score = kps[0]  # Nose keypoint
+            
+            if score > 0.3:  # Confidence threshold
+                current_pos = np.array([x, y])
+                positions.append(current_pos)
+                timestamps.append(current_time)
+                
+                if prev_pos is not None:
+                    dt = timestamps[-1] - timestamps[-2]
+                    current_vel = (current_pos - prev_pos) / dt
+                    velocities.append(current_vel)
+                    
+                    if prev_vel is not None:
+                        current_acc = (current_vel - prev_vel) / dt
+                        accelerations.append(current_acc)
+                    
+                    prev_vel = current_vel
+                prev_pos = current_pos
+                
+                # Show progress
+                progress = (time.time() - start_time) / duration * 100
+                self._draw_progress(frame, f"{phase} Calibration", progress)
+                cv2.circle(frame, (int(x*frame.shape[1]), int(y*frame.shape[0])), 
+                          6, (0,0,255), -1)
+                cv2.imshow("Calibration", frame)
+                
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+                
+        return CalibrationData(
+            np.array(positions),
+            np.array(velocities),
+            np.array(accelerations),
+            np.array(timestamps)
+        )
+    
+    @staticmethod
+    def _calculate_jitter(filtered: np.ndarray, raw: np.ndarray) -> float:
+        """
+        Calculate jitter as direct std comparison between filtered and raw data.
+        Lower filtered std means better noise reduction.
+        """
+        raw_std = np.std(raw, axis=0)      # Standard deviation of raw data
+        filtered_std = np.std(filtered, axis=0)  # Standard deviation of filtered data
+        
+        # Compare stds directly (no ratio)
+        return np.mean(filtered_std)  # Return average std across x,y dimensions
+
+    @staticmethod
+    def _calculate_lag(filtered: np.ndarray, raw: np.ndarray) -> float:
+        """
+        Calculate point-by-point residual variance between filtered and raw signals.
+        Smaller residuals mean better tracking.
+        """
+        # Calculate residuals between corresponding points
+        residuals = filtered - raw
+        
+        # Calculate mean squared error
+        mse = np.mean(np.square(residuals))
+        return mse
+    
+    def optimize_parameters(self, still_data: CalibrationData, 
+                          move_data: CalibrationData) -> Tuple[float, float]:
+        """Find optimal Q,R parameters using grid search"""
+        # Parameter search space
+        qs = np.logspace(-12, -2, 15)  # Process noise values
+        rs = np.linspace(0.1, 10.0, 15) # Measurement noise scales
+        
+        best_cost = float('inf')
+        best_q = None
+        best_r = None
+        
+        for q in qs:
+            for r in rs:
+                # Test parameters on still data (jitter)
+                still_filtered = self._simulate_filter(
+                    still_data.positions, 
+                    still_data.timestamps, q, r
+                )
+                jitter = self._calculate_jitter(still_filtered, still_data.positions)
+                
+                # Test parameters on movement data (residual variance)
+                move_filtered = self._simulate_filter(
+                    move_data.positions,
+                    move_data.timestamps, q, r
+                )
+                residual = self._calculate_lag(move_filtered, move_data.positions)
+                
+                # Combined cost (weighted sum)
+                # Penalize both high jitter (>1) and high residuals
+                cost = 0.7 * abs(jitter - 1.0) + 0.3 * residual
+                
+                if cost < best_cost:
+                    best_cost = cost
+                    best_q = q
+                    best_r = r
+                    
+        return best_q, best_r
+    
+    def _simulate_filter(self, positions: np.ndarray, timestamps: np.ndarray, 
+                        q: float, r: float) -> np.ndarray:
+        """Simulate Kalman filter with given parameters on position data"""
+        # Initialize Kalman filter with base measurement noise
+        kf = cv2.KalmanFilter(6, 6, 0, cv2.CV_32F)
+        
+        # Set transition matrix (will update dt each step)
+        kf.transitionMatrix = np.array([
+            [1,0, 0,0, 0, 0],  # Will update with dt
+            [0,1, 0,0, 0, 0],
+            [0,0, 1,0, 0, 0],
+            [0,0, 0,1, 0, 0],
+            [0,0, 0,0, 1, 0],
+            [0,0, 0,0, 0, 1]
+        ], np.float32)
+        
+        kf.measurementMatrix = np.eye(6, dtype=np.float32)
+        kf.errorCovPost = np.eye(6, dtype=np.float32)
+        
+        filtered = np.zeros_like(positions)
+        prev_pos = positions[0]
+        prev_vel = np.zeros(2)
+        
+        for i in range(len(positions)):
+            # Calculate dt
+            dt = timestamps[i] - timestamps[i-1] if i > 0 else 1/30
+            
+            # Update transition matrix with current dt
+            kf.transitionMatrix[0,2] = dt
+            kf.transitionMatrix[0,4] = 0.5*dt*dt
+            kf.transitionMatrix[1,3] = dt
+            kf.transitionMatrix[1,5] = 0.5*dt*dt
+            kf.transitionMatrix[2,4] = dt
+            kf.transitionMatrix[3,5] = dt
+            
+            # Update noise matrices
+            kf.processNoiseCov = make_const_accel_Q(q, dt)
+            kf.measurementNoiseCov = self.original_meas_cov * r
+            
+            # Calculate derivatives
+            current_pos = positions[i]
+            current_vel = (current_pos - prev_pos) / dt if i > 0 else np.zeros(2)
+            current_acc = (current_vel - prev_vel) / dt if i > 0 else np.zeros(2)
+            
+            # Predict and correct
+            kf.predict()
+            z = np.array([
+                current_pos[0], current_pos[1],
+                current_vel[0], current_vel[1],
+                current_acc[0], current_acc[1]
+            ], dtype=np.float32).reshape(-1, 1)
+            
+            filtered_state = kf.correct(z)
+            filtered[i] = [filtered_state[0][0], filtered_state[1][0]]
+            
+            # Update previous values
+            prev_pos = current_pos
+            prev_vel = current_vel
+            
+        return filtered
+
+    # Add to AutoCalibrator class
+    def _draw_countdown(self, frame, text: str, seconds: int):
+        h, w = frame.shape[:2]
+        cv2.putText(frame, f"{text}: {seconds}", (w//4, h//2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,255,0), 2)
+
+    def _draw_progress(self, frame, text: str, progress: float):
+        h, w = frame.shape[:2]
+        cv2.putText(frame, f"{text}: {progress:.1f}%", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
